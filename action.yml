@@ -201,8 +201,14 @@ runs:
               echo "Adding package: $package"
               # Check if package is already in deps
               if ! grep -q "$package" "$REBAR_CONFIG"; then
-                # Safely add to deps list
-                sed -i "/{deps, \[/ s/\]/, {$package, \".*\"}&/" "$REBAR_CONFIG"
+                # Check if deps list is empty
+                if grep -q "{deps, \[\]}" "$REBAR_CONFIG"; then
+                  # Replace empty list with the package
+                  sed -i "s/{deps, \[\]}/{deps, [{$package, \".*\"}]}/" "$REBAR_CONFIG"
+                else
+                  # Add to existing list
+                  sed -i "/{deps, \[/ s/\]/, {$package, \".*\"}]/" "$REBAR_CONFIG"
+                fi
               fi
             fi
           done
@@ -219,8 +225,14 @@ runs:
               echo "Attempting to add dependency for: $dep"
               # Check if dep is already in rebar.config
               if ! grep -q "$dep" "$REBAR_CONFIG"; then
-                # Safely add to deps list
-                sed -i "/{deps, \[/ s/\]/, {$dep, \".*\"}&/" "$REBAR_CONFIG"
+                # Check if deps list is empty
+                if grep -q "{deps, \[\]}" "$REBAR_CONFIG"; then
+                  # Replace empty list with the dependency
+                  sed -i "s/{deps, \[\]}/{deps, [{$dep, \".*\"}]}/" "$REBAR_CONFIG"
+                else
+                  # Add to existing list
+                  sed -i "/{deps, \[/ s/\]/, {$dep, \".*\"}]/" "$REBAR_CONFIG"
+                fi
               fi
             fi
           done
