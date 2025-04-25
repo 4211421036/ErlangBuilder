@@ -204,10 +204,10 @@ runs:
                 # Check if deps list is empty
                 if grep -q "{deps, \[\]}" "$REBAR_CONFIG"; then
                   # Replace empty list with the package
-                  sed -i "s/{deps, \[\]}/{deps, [{$package, \".*\"}]}/" "$REBAR_CONFIG"
+                  sed -i "s/{deps, \[\]}/{deps, [{$package}]}/" "$REBAR_CONFIG"
                 else
                   # Add to existing list
-                  sed -i "/{deps, \[/ s/\]/, {$package, \".*\"}]/" "$REBAR_CONFIG"
+                  sed -i "/{deps, \[/ s/\]/, {$package}]/" "$REBAR_CONFIG"
                 fi
               fi
             fi
@@ -228,10 +228,10 @@ runs:
                 # Check if deps list is empty
                 if grep -q "{deps, \[\]}" "$REBAR_CONFIG"; then
                   # Replace empty list with the dependency
-                  sed -i "s/{deps, \[\]}/{deps, [{$dep, \".*\"}]}/" "$REBAR_CONFIG"
+                  sed -i "s/{deps, \[\]}/{deps, [{$dep}]}/" "$REBAR_CONFIG"
                 else
                   # Add to existing list
-                  sed -i "/{deps, \[/ s/\]/, {$dep, \".*\"}]/" "$REBAR_CONFIG"
+                  sed -i "/{deps, \[/ s/\]/, {$dep}]/" "$REBAR_CONFIG"
                 fi
               fi
             fi
