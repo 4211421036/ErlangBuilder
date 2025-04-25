@@ -131,73 +131,44 @@ runs:
             
             lists:filter(fun(Module) -> not lists:member(Module, StdModules) end, lists:usort(Modules)).
         EOF
-                chmod +x dependency_analyzer.escript
+        chmod +x dependency_analyzer.escript
     
-    - name: Setup rebar3 project
+    - name: Check for existing rebar.config or create new one
       shell: bash
+      id: rebar_config
       run: |
-        # Create a temporary rebar3 project to manage dependencies
-        mkdir -p erlang_project
-        cd erlang_project
+        # Check if rebar.config exists in the source directory
+        if [ -f "${{ inputs.erlang-source }}/rebar.config" ] || [ -f "rebar.config" ]; then
+          echo "Using existing rebar.config"
+          echo "rebar_exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "Creating new rebar.config"
+          echo "rebar_exists=false" >> $GITHUB_OUTPUT
+          
+          # Create a minimal rebar.config in the source directory
+          if [ -d "${{ inputs.erlang-source }}" ]; then
+            CONFIG_DIR="${{ inputs.erlang-source }}"
+          else
+            CONFIG_DIR="."
+          fi
+          
+          cat > "$CONFIG_DIR/rebar.config" << 'EOF'
+        {erl_opts, [debug_info]}.
+        {deps, []}.
         
-        # Initialize a new rebar3 project
-        rebar3 new app name=temp_build
-        
-        # Now make sure we're in the correct directory for rebar.config
-        cd temp_build
-        
-        # Add user-specified hex packages
-        if [ -n "${{ inputs.hex-packages }}" ]; then
-          echo "Adding user-specified packages: ${{ inputs.hex-packages }}"
-          IFS=',' read -ra PACKAGES <<< "${{ inputs.hex-packages }}"
-          for package in "${PACKAGES[@]}"; do
-            package=$(echo $package | tr -d ' ')
-            if [ -n "$package" ]; then
-              echo "Adding package: $package"
-              # Safer approach to modify rebar.config
-              cp rebar.config rebar.config.bak
-              if grep -q "deps" rebar.config; then
-                sed -i "s/{deps, \[\]}/{deps, \[{$package, \".*\"}\]}/g" rebar.config
-              else
-                echo "{deps, [{$package, \".*\"}]}." >> rebar.config
-              fi
-            fi
-          done
+        {profiles, [
+          {prod, [
+            {erl_opts, [no_debug_info, warnings_as_errors]}
+          ]},
+          {test, [
+            {erl_opts, [debug_info]}
+          ]}
+        ]}.
+        EOF
+          
+          echo "Created new rebar.config in $CONFIG_DIR"
         fi
-        
-        # Try to resolve detected dependencies to hex packages
-        DEPS="${{ steps.analyze_deps.outputs.detected_deps }}"
-        if [ -n "$DEPS" ] && [ "$DEPS" != "[]" ]; then
-          echo "Processing detected dependencies: $DEPS"
-          # Strip brackets and quotes
-          CLEAN_DEPS=$(echo $DEPS | tr -d '[]"' | tr ',' ' ')
-          for dep in $CLEAN_DEPS; do
-            if [ -n "$dep" ]; then
-              echo "Attempting to add dependency for: $dep"
-              # Check if dep is already in rebar.config
-              if ! grep -q "$dep" rebar.config; then
-                # Add with safer approach
-                cp rebar.config rebar.config.bak
-                if grep -q "deps" rebar.config; then
-                  sed -i "s/{deps, \[\(.*\)\]}/{deps, \[\1{$dep, \".*\"}\]}/g" rebar.config 
-                else
-                  echo "{deps, [{$dep, \".*\"}]}." >> rebar.config
-                fi
-              fi
-            fi
-          done
-        fi
-        
-        # Show the final rebar.config
-        echo "Final rebar.config:"
-        cat rebar.config
-        
-        # Get dependencies
-        rebar3 get-deps
-        
-        # Return to original directory
-        cd ../..
-      
+    
     - name: Analyze dependencies in Erlang source
       shell: bash
       id: analyze_deps
@@ -207,36 +178,49 @@ runs:
         echo "Detected dependencies: $DETECTED_DEPS"
         echo "detected_deps=$DETECTED_DEPS" >> $GITHUB_OUTPUT
       
-    - name: Setup rebar3 project
+    - name: Update rebar.config with dependencies
       shell: bash
       run: |
-        # Create a temporary rebar3 project to manage dependencies
-        mkdir -p erlang_project
-        cd erlang_project
+        # Determine where the rebar.config is located
+        if [ -f "${{ inputs.erlang-source }}/rebar.config" ]; then
+          REBAR_CONFIG="${{ inputs.erlang-source }}/rebar.config"
+        else
+          REBAR_CONFIG="rebar.config"
+        fi
         
-        # Initialize a new rebar3 project
-        rebar3 new app name=temp_build
+        # Backup the original config
+        cp "$REBAR_CONFIG" "$REBAR_CONFIG.bak"
         
         # Add user-specified hex packages
         if [ -n "${{ inputs.hex-packages }}" ]; then
+          echo "Adding user-specified packages: ${{ inputs.hex-packages }}"
           IFS=',' read -ra PACKAGES <<< "${{ inputs.hex-packages }}"
           for package in "${PACKAGES[@]}"; do
-            echo "Adding hex package: $package"
-            sed -i "s/{deps, \[\]}/{deps, \[{$(echo $package | tr -d ' '),\s\".*\"}\]}/g" rebar.config
+            package=$(echo $package | tr -d ' ')
+            if [ -n "$package" ]; then
+              echo "Adding package: $package"
+              # Check if package is already in deps
+              if ! grep -q "$package" "$REBAR_CONFIG"; then
+                # Safely add to deps list
+                sed -i "/{deps, \[/ s/\]/, {$package, \".*\"}&/" "$REBAR_CONFIG"
+              fi
+            fi
           done
         fi
         
-        # Try to resolve detected dependencies to hex packages
-        # This is simplified - in a real implementation, you'd want a more sophisticated mapping
+        # Add detected dependencies
         DEPS="${{ steps.analyze_deps.outputs.detected_deps }}"
         if [ -n "$DEPS" ] && [ "$DEPS" != "[]" ]; then
-          for dep in $(echo $DEPS | tr -d '[]' | tr ',' ' '); do
-            dep=$(echo $dep | tr -d ' "')
+          echo "Processing detected dependencies: $DEPS"
+          # Strip brackets and quotes
+          CLEAN_DEPS=$(echo $DEPS | tr -d '[]"' | tr ',' ' ')
+          for dep in $CLEAN_DEPS; do
             if [ -n "$dep" ]; then
               echo "Attempting to add dependency for: $dep"
               # Check if dep is already in rebar.config
-              if ! grep -q "$dep" rebar.config; then
-                sed -i "s/{deps, \[\(.*\)\]}/{deps, \[\1,{$dep, \".*\"}\]}/g" rebar.config
+              if ! grep -q "$dep" "$REBAR_CONFIG"; then
+                # Safely add to deps list
+                sed -i "/{deps, \[/ s/\]/, {$dep, \".*\"}&/" "$REBAR_CONFIG"
               fi
             fi
           done
@@ -244,10 +228,19 @@ runs:
         
         # Show the final rebar.config
         echo "Final rebar.config:"
-        cat rebar.config
-        
-        # Get dependencies
+        cat "$REBAR_CONFIG"
+      
+    - name: Get dependencies
+      shell: bash
+      run: |
+        # Run rebar3 get-deps in the directory containing rebar.config
+        if [ -f "${{ inputs.erlang-source }}/rebar.config" ]; then
+          cd "${{ inputs.erlang-source }}"
+        fi
         rebar3 get-deps
+        if [ -f "${{ inputs.erlang-source }}/rebar.config" ]; then
+          cd -
+        fi
       
     - name: Prepare build environment
       shell: bash
@@ -255,15 +248,23 @@ runs:
         # Copy all source files to build directory
         if [ -d "${{ inputs.erlang-source }}" ]; then
           cp -r "${{ inputs.erlang-source }}"/* ${{ inputs.output-dir }}/
+          # Also copy rebar.config if it exists in source directory
+          if [ -f "${{ inputs.erlang-source }}/rebar.config" ]; then
+            cp "${{ inputs.erlang-source }}/rebar.config" ${{ inputs.output-dir }}/
+          fi
         else
           # If source is a single file
           cp "${{ inputs.erlang-source }}" ${{ inputs.output-dir }}/
+          # Copy rebar.config if it exists in root
+          if [ -f "rebar.config" ]; then
+            cp "rebar.config" ${{ inputs.output-dir }}/
+          fi
         fi
         
         # Copy any dependencies from rebar3 project if they exist
-        if [ -d "erlang_project/_build/default/lib" ]; then
+        if [ -d "_build/default/lib" ]; then
           echo "Copying dependencies to build directory..."
-          for dep_dir in erlang_project/_build/default/lib/*; do
+          for dep_dir in _build/default/lib/*; do
             dep_name=$(basename "$dep_dir")
             if [ "$dep_name" != "temp_build" ]; then
               echo "Copying $dep_name to build directory"
@@ -343,18 +344,18 @@ runs:
             end.
         EOF
         
-                chmod +x ${{ inputs.output-dir }}/compile_all.escript
-                
-                # Change to build directory and compile all files
-                cd ${{ inputs.output-dir }}
-                ./compile_all.escript .
-                
-                # Proceed based on the selected mode
-                if [ "${{ inputs.build-mode }}" == "build" ]; then
-                  echo "Building executable..."
-                  
-                  # Create a script to generate the release
-                  cat > make_release.escript << 'EOF'
+        chmod +x ${{ inputs.output-dir }}/compile_all.escript
+        
+        # Change to build directory and compile all files
+        cd ${{ inputs.output-dir }}
+        ./compile_all.escript .
+        
+        # Proceed based on the selected mode
+        if [ "${{ inputs.build-mode }}" == "build" ]; then
+          echo "Building executable..."
+          
+          # Create a script to generate the release
+          cat > make_release.escript << 'EOF'
         #!/usr/bin/env escript
         %%! -smp enable
         
@@ -403,17 +404,17 @@ runs:
             
             io:format("Release package created successfully~n").
         EOF
-                  
-                  chmod +x make_release.escript
-                  ./make_release.escript $MAIN_MODULE
-                  
-                  echo "Executable package created in ${{ inputs.output-dir }}"
-                  
-                elif [ "${{ inputs.build-mode }}" == "debug" ]; then
-                  echo "Running in debug mode..."
-                  
-                  # Create debug runner script that handles any Erlang file
-                  cat > debug_runner.sh << 'EOF'
+          
+          chmod +x make_release.escript
+          ./make_release.escript $MAIN_MODULE
+          
+          echo "Executable package created in ${{ inputs.output-dir }}"
+          
+        elif [ "${{ inputs.build-mode }}" == "debug" ]; then
+          echo "Running in debug mode..."
+          
+          # Create debug runner script that handles any Erlang file
+          cat > debug_runner.sh << 'EOF'
         #!/bin/bash
         MODULE_NAME=$(basename "$1" .erl)
         
@@ -435,17 +436,17 @@ runs:
         fi
         EOF
         
-                  chmod +x debug_runner.sh
-                  
-                  # Run the main module in debug mode
-                  echo "Starting debug session for $MAIN_MODULE"
-                  ./debug_runner.sh "$MAIN_MODULE"
-                  
-                  echo "Debug session completed"
-                else
-                  echo "Error: Unknown build mode '${{ inputs.build-mode }}'. Use 'build' or 'debug'."
-                  exit 1
-                fi
+          chmod +x debug_runner.sh
+          
+          # Run the main module in debug mode
+          echo "Starting debug session for $MAIN_MODULE"
+          ./debug_runner.sh "$MAIN_MODULE"
+          
+          echo "Debug session completed"
+        else
+          echo "Error: Unknown build mode '${{ inputs.build-mode }}'. Use 'build' or 'debug'."
+          exit 1
+        fi
         
     - name: List build outputs
       shell: bash
