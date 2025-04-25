@@ -204,17 +204,17 @@ runs:
                 # Check if deps list is empty
                 if grep -q "{deps, \[\]}" "$REBAR_CONFIG"; then
                   # Replace empty list with the package
-                  sed -i "s/{deps, \[\]}/{deps, [{$package}]}/" "$REBAR_CONFIG"
+                  sed -i "s/{deps, \[\]}/{deps, [${package%:*}]}/" "$REBAR_CONFIG"
                 else
                   # Add to existing list
-                  sed -i "/{deps, \[/ s/\]/, {$package}]/" "$REBAR_CONFIG"
+                  sed -i "/{deps, \[/ s/\]/, ${package%:*}]/" "$REBAR_CONFIG"
                 fi
               fi
             fi
           done
         fi
         
-        # Add detected dependencies
+        # Add detected dependencies only if they exist in Hex
         DEPS="${{ steps.analyze_deps.outputs.detected_deps }}"
         if [ -n "$DEPS" ] && [ "$DEPS" != "[]" ]; then
           echo "Processing detected dependencies: $DEPS"
@@ -222,17 +222,18 @@ runs:
           CLEAN_DEPS=$(echo $DEPS | tr -d '[]"' | tr ',' ' ')
           for dep in $CLEAN_DEPS; do
             if [ -n "$dep" ]; then
-              echo "Attempting to add dependency for: $dep"
-              # Check if dep is already in rebar.config
-              if ! grep -q "$dep" "$REBAR_CONFIG"; then
-                # Check if deps list is empty
-                if grep -q "{deps, \[\]}" "$REBAR_CONFIG"; then
-                  # Replace empty list with the dependency
-                  sed -i "s/{deps, \[\]}/{deps, [{$dep}]}/" "$REBAR_CONFIG"
-                else
-                  # Add to existing list
-                  sed -i "/{deps, \[/ s/\]/, {$dep}]/" "$REBAR_CONFIG"
+              echo "Checking if $dep exists in Hex..."
+              if rebar3 hex search $dep >/dev/null 2>&1; then
+                echo "Adding Hex package: $dep"
+                if ! grep -q "$dep" "$REBAR_CONFIG"; then
+                  if grep -q "{deps, \[\]}" "$REBAR_CONFIG"; then
+                    sed -i "s/{deps, \[\]}/{deps, [$dep]}/" "$REBAR_CONFIG"
+                  else
+                    sed -i "/{deps, \[/ s/\]/, $dep]/" "$REBAR_CONFIG"
+                  fi
                 fi
+              else
+                echo "Skipping $dep - not found in Hex"
               fi
             fi
           done
