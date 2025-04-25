@@ -132,6 +132,71 @@ runs:
             lists:filter(fun(Module) -> not lists:member(Module, StdModules) end, lists:usort(Modules)).
         EOF
                 chmod +x dependency_analyzer.escript
+    
+    - name: Setup rebar3 project
+      shell: bash
+      run: |
+        # Create a temporary rebar3 project to manage dependencies
+        mkdir -p erlang_project
+        cd erlang_project
+        
+        # Initialize a new rebar3 project
+        rebar3 new app name=temp_build
+        
+        # Now make sure we're in the correct directory for rebar.config
+        cd temp_build
+        
+        # Add user-specified hex packages
+        if [ -n "${{ inputs.hex-packages }}" ]; then
+          echo "Adding user-specified packages: ${{ inputs.hex-packages }}"
+          IFS=',' read -ra PACKAGES <<< "${{ inputs.hex-packages }}"
+          for package in "${PACKAGES[@]}"; do
+            package=$(echo $package | tr -d ' ')
+            if [ -n "$package" ]; then
+              echo "Adding package: $package"
+              # Safer approach to modify rebar.config
+              cp rebar.config rebar.config.bak
+              if grep -q "deps" rebar.config; then
+                sed -i "s/{deps, \[\]}/{deps, \[{$package, \".*\"}\]}/g" rebar.config
+              else
+                echo "{deps, [{$package, \".*\"}]}." >> rebar.config
+              fi
+            fi
+          done
+        fi
+        
+        # Try to resolve detected dependencies to hex packages
+        DEPS="${{ steps.analyze_deps.outputs.detected_deps }}"
+        if [ -n "$DEPS" ] && [ "$DEPS" != "[]" ]; then
+          echo "Processing detected dependencies: $DEPS"
+          # Strip brackets and quotes
+          CLEAN_DEPS=$(echo $DEPS | tr -d '[]"' | tr ',' ' ')
+          for dep in $CLEAN_DEPS; do
+            if [ -n "$dep" ]; then
+              echo "Attempting to add dependency for: $dep"
+              # Check if dep is already in rebar.config
+              if ! grep -q "$dep" rebar.config; then
+                # Add with safer approach
+                cp rebar.config rebar.config.bak
+                if grep -q "deps" rebar.config; then
+                  sed -i "s/{deps, \[\(.*\)\]}/{deps, \[\1{$dep, \".*\"}\]}/g" rebar.config 
+                else
+                  echo "{deps, [{$dep, \".*\"}]}." >> rebar.config
+                fi
+              fi
+            fi
+          done
+        fi
+        
+        # Show the final rebar.config
+        echo "Final rebar.config:"
+        cat rebar.config
+        
+        # Get dependencies
+        rebar3 get-deps
+        
+        # Return to original directory
+        cd ../..
       
     - name: Analyze dependencies in Erlang source
       shell: bash
