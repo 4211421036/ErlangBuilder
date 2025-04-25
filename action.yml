@@ -1,0 +1,389 @@
+name: 'Erlang Build and Run Action'
+description: 'Compile Erlang files to executable or run them in debug mode with automatic dependency management'
+author: 'GALIH RIDHO UTOMO'
+branding:
+  icon: 'package'
+  color: 'red'
+
+inputs:
+  erlang-source:
+    description: 'Path to Erlang source file or directory'
+    required: true
+  build-mode:
+    description: 'Mode to run the action (build or debug)'
+    required: true
+    default: 'build'
+  output-dir:
+    description: 'Directory for build output'
+    required: false
+    default: './build'
+  erts-version:
+    description: 'Erlang/OTP version to use'
+    required: false
+    default: '25.0'
+  hex-packages:
+    description: 'Additional Hex packages to install (comma-separated)'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Set up Erlang
+      uses: erlef/setup-beam@v1
+      with:
+        otp-version: ${{ inputs.erts-version }}
+        rebar3-version: '3.20.0'
+        
+    - name: Create build directory
+      shell: bash
+      run: mkdir -p ${{ inputs.output-dir }}
+      
+    - name: Setup dependency detection script
+      shell: bash
+      run: |
+        # Create dependency detection script
+        cat > dependency_analyzer.escript << 'EOF'
+#!/usr/bin/env escript
+%%! -smp enable
+
+main([SourcePath]) ->
+    case filelib:is_dir(SourcePath) of
+        true ->
+            Patterns = [SourcePath ++ "/**/*.erl", SourcePath ++ "/*.erl"],
+            Files = lists:flatten([filelib:wildcard(Pattern) || Pattern <- Patterns]);
+        false ->
+            Files = [SourcePath]
+    end,
+    
+    % Process each file and extract dependencies
+    Dependencies = lists:foldl(
+        fun(File, Acc) ->
+            {ok, Content} = file:read_file(File),
+            Lines = binary:split(Content, <<"\n">>, [global]),
+            
+            % Look for -include and -include_lib directives
+            IncludeDeps = extract_includes(Lines),
+            
+            % Look for module imports
+            ModuleDeps = extract_imports(Lines),
+            
+            % Add to accumulator
+            IncludeDeps ++ ModuleDeps ++ Acc
+        end, [], Files),
+    
+    % Output unique dependencies
+    UniqueDeps = lists:usort(Dependencies),
+    io:format("~p~n", [UniqueDeps]).
+
+extract_includes(Lines) ->
+    IncludePattern = "-include\\(.*?\\)\\.",
+    IncludeLibPattern = "-include_lib\\(.*?\\)\\.",
+    
+    Includes = lists:foldl(
+        fun(Line, Acc) ->
+            LineStr = binary_to_list(Line),
+            case re:run(LineStr, IncludePattern) of
+                {match, _} ->
+                    {match, [Include]} = re:run(LineStr, "\"(.*?)\"", [{capture, all_but_first, list}]),
+                    [Include | Acc];
+                nomatch ->
+                    case re:run(LineStr, IncludeLibPattern) of
+                        {match, _} ->
+                            {match, [Include]} = re:run(LineStr, "\"(.*?)\"", [{capture, all_but_first, list}]),
+                            [Include | Acc];
+                        nomatch ->
+                            Acc
+                    end
+            end
+        end, [], Lines),
+    Includes.
+
+extract_imports(Lines) ->
+    % Look for usage of remote modules
+    ModuleUsagePattern = "[A-Za-z][A-Za-z0-9_]*:[A-Za-z][A-Za-z0-9_]*\\(",
+    
+    Modules = lists:foldl(
+        fun(Line, Acc) ->
+            LineStr = binary_to_list(Line),
+            case re:run(LineStr, ModuleUsagePattern) of
+                {match, _} ->
+                    Matches = re:run(LineStr, "([A-Za-z][A-Za-z0-9_]*):", [{capture, all_but_first, list}, global]),
+                    case Matches of
+                        {match, ListOfModules} ->
+                            FlattenedModules = lists:flatten(ListOfModules),
+                            FlattenedModules ++ Acc;
+                        _ ->
+                            Acc
+                    end;
+                nomatch ->
+                    Acc
+            end
+        end, [], Lines),
+    
+    % Filter out standard modules that are part of OTP
+    StdModules = ["io", "lists", "maps", "proplists", "file", "erlang", "gen_server", "application",
+                  "supervisor", "crypto", "ssl", "inets", "string", "binary", "code", "gen_statem",
+                  "gen_event", "timer", "os", "filelib", "re", "proc_lib", "sys", "unicode"],
+    
+    lists:filter(fun(Module) -> not lists:member(Module, StdModules) end, lists:usort(Modules)).
+EOF
+        chmod +x dependency_analyzer.escript
+      
+    - name: Analyze dependencies in Erlang source
+      shell: bash
+      id: analyze_deps
+      run: |
+        echo "Analyzing dependencies in ${{ inputs.erlang-source }}"
+        DETECTED_DEPS=$(./dependency_analyzer.escript "${{ inputs.erlang-source }}")
+        echo "Detected dependencies: $DETECTED_DEPS"
+        echo "detected_deps=$DETECTED_DEPS" >> $GITHUB_OUTPUT
+      
+    - name: Setup rebar3 project
+      shell: bash
+      run: |
+        # Create a temporary rebar3 project to manage dependencies
+        mkdir -p erlang_project
+        cd erlang_project
+        
+        # Initialize a new rebar3 project
+        rebar3 new app name=temp_build
+        
+        # Add user-specified hex packages
+        if [ -n "${{ inputs.hex-packages }}" ]; then
+          IFS=',' read -ra PACKAGES <<< "${{ inputs.hex-packages }}"
+          for package in "${PACKAGES[@]}"; do
+            echo "Adding hex package: $package"
+            sed -i "s/{deps, \[\]}/{deps, \[{$(echo $package | tr -d ' '),\s\".*\"}\]}/g" rebar.config
+          done
+        fi
+        
+        # Try to resolve detected dependencies to hex packages
+        # This is simplified - in a real implementation, you'd want a more sophisticated mapping
+        DEPS="${{ steps.analyze_deps.outputs.detected_deps }}"
+        if [ -n "$DEPS" ] && [ "$DEPS" != "[]" ]; then
+          for dep in $(echo $DEPS | tr -d '[]' | tr ',' ' '); do
+            dep=$(echo $dep | tr -d ' "')
+            if [ -n "$dep" ]; then
+              echo "Attempting to add dependency for: $dep"
+              # Check if dep is already in rebar.config
+              if ! grep -q "$dep" rebar.config; then
+                sed -i "s/{deps, \[\(.*\)\]}/{deps, \[\1,{$dep, \".*\"}\]}/g" rebar.config
+              fi
+            fi
+          done
+        fi
+        
+        # Show the final rebar.config
+        echo "Final rebar.config:"
+        cat rebar.config
+        
+        # Get dependencies
+        rebar3 get-deps
+      
+    - name: Prepare build environment
+      shell: bash
+      run: |
+        # Copy all source files to build directory
+        if [ -d "${{ inputs.erlang-source }}" ]; then
+          cp -r "${{ inputs.erlang-source }}"/* ${{ inputs.output-dir }}/
+        else
+          # If source is a single file
+          cp "${{ inputs.erlang-source }}" ${{ inputs.output-dir }}/
+        fi
+        
+        # Copy any dependencies from rebar3 project if they exist
+        if [ -d "erlang_project/_build/default/lib" ]; then
+          echo "Copying dependencies to build directory..."
+          for dep_dir in erlang_project/_build/default/lib/*; do
+            dep_name=$(basename "$dep_dir")
+            if [ "$dep_name" != "temp_build" ]; then
+              echo "Copying $dep_name to build directory"
+              mkdir -p ${{ inputs.output-dir }}/deps/$dep_name
+              cp -r "$dep_dir"/* ${{ inputs.output-dir }}/deps/$dep_name/
+            fi
+          done
+        fi
+      
+    - name: Compile Erlang code
+      shell: bash
+      run: |
+        echo "Processing Erlang source: ${{ inputs.erlang-source }}"
+        
+        # Add paths to dependencies if they exist
+        DEPS_PATHS=""
+        if [ -d "${{ inputs.output-dir }}/deps" ]; then
+          for dep_dir in ${{ inputs.output-dir }}/deps/*; do
+            DEPS_PATHS="$DEPS_PATHS -pa $dep_dir/ebin"
+          done
+        fi
+        
+        # Check if source is a file or directory
+        if [ -f "${{ inputs.erlang-source }}" ]; then
+          SOURCE_FILES="${{ inputs.erlang-source }}"
+          # Extract the main module name for later
+          MAIN_MODULE=$(basename "${{ inputs.erlang-source }}" .erl)
+        elif [ -d "${{ inputs.erlang-source }}" ]; then
+          SOURCE_FILES=$(find ${{ inputs.erlang-source }} -name "*.erl")
+          # Use the first file as main module if multiple files
+          FIRST_FILE=$(echo $SOURCE_FILES | cut -d' ' -f1)
+          MAIN_MODULE=$(basename "$FIRST_FILE" .erl)
+        else
+          echo "Error: Source not found at ${{ inputs.erlang-source }}"
+          exit 1
+        fi
+        
+        # Ensure we can find all the files
+        echo "Files to compile:"
+        echo "$SOURCE_FILES"
+        
+        # Create a utility script to compile all modules with dependencies
+        cat > ${{ inputs.output-dir }}/compile_all.escript << 'EOF'
+#!/usr/bin/env escript
+%%! -smp enable
+
+main([OutputDir | _]) ->
+    % Scan for all .erl files in current directory and subdirectories
+    Files = filelib:fold_files(
+        ".", 
+        ".*\\.erl$", 
+        true,
+        fun(F, Acc) -> [F | Acc] end,
+        []
+    ),
+    
+    io:format("Found ~p Erlang source files~n", [length(Files)]),
+    
+    % Compile each file
+    Results = [compile_file(F, OutputDir) || F <- Files],
+    
+    % Check for any compilation errors
+    case lists:any(fun(R) -> R =:= error end, Results) of
+        true -> io:format("Compilation failed~n"), halt(1);
+        false -> io:format("All files compiled successfully~n")
+    end.
+
+compile_file(File, OutputDir) ->
+    io:format("Compiling ~s~n", [File]),
+    case compile:file(File, [debug_info, {outdir, OutputDir}]) of
+        {ok, _Module} -> 
+            io:format("Successfully compiled ~s~n", [File]),
+            ok;
+        error ->
+            io:format("Failed to compile ~s~n", [File]),
+            error
+    end.
+EOF
+
+        chmod +x ${{ inputs.output-dir }}/compile_all.escript
+        
+        # Change to build directory and compile all files
+        cd ${{ inputs.output-dir }}
+        ./compile_all.escript .
+        
+        # Proceed based on the selected mode
+        if [ "${{ inputs.build-mode }}" == "build" ]; then
+          echo "Building executable..."
+          
+          # Create a script to generate the release
+          cat > make_release.escript << 'EOF'
+#!/usr/bin/env escript
+%%! -smp enable
+
+main([MainModule | _]) ->
+    % Convert string to atom
+    MainModuleAtom = list_to_atom(MainModule),
+    
+    % Find all beam files
+    ModuleFiles = filelib:wildcard("*.beam"),
+    Modules = [list_to_atom(filename:basename(F, ".beam")) || F <- ModuleFiles],
+    
+    io:format("Found modules: ~p~n", [Modules]),
+    io:format("Main module: ~p~n", [MainModuleAtom]),
+    
+    % Create .app file for our application
+    AppFile = MainModule ++ ".app",
+    AppContent = io_lib:format(
+        "{application, ~s, [
+            {description, \"Erlang Application\"},
+            {vsn, \"1.0.0\"},
+            {modules, ~p},
+            {registered, []},
+            {applications, [kernel, stdlib]},
+            {mod, {~s, []}}
+        ]}.", [MainModuleAtom, Modules, MainModuleAtom]),
+    
+    file:write_file(AppFile, AppContent),
+    io:format("Created application file: ~s~n", [AppFile]),
+    
+    % Create .rel file
+    RelFile = MainModule ++ ".rel",
+    RelContent = io_lib:format(
+        "{release, {\"~s\", \"1.0.0\"}, 
+         {erts, \"~s\"},
+         [{kernel, \"8.0\"}, 
+          {stdlib, \"4.0\"},
+          {\"~s\", \"1.0.0\"}]
+        }.", [MainModule, erlang:system_info(version), MainModule]),
+    
+    file:write_file(RelFile, RelContent),
+    io:format("Created release file: ~s~n", [RelFile]),
+    
+    % Generate boot scripts
+    systools:make_script(MainModule, []),
+    systools:make_tar(MainModule, [{erts, code:root_dir()}]),
+    
+    io:format("Release package created successfully~n").
+EOF
+          
+          chmod +x make_release.escript
+          ./make_release.escript $MAIN_MODULE
+          
+          echo "Executable package created in ${{ inputs.output-dir }}"
+          
+        elif [ "${{ inputs.build-mode }}" == "debug" ]; then
+          echo "Running in debug mode..."
+          
+          # Create debug runner script that handles any Erlang file
+          cat > debug_runner.sh << 'EOF'
+#!/bin/bash
+MODULE_NAME=$(basename "$1" .erl)
+
+# Check if the module has a start/0 function by looking at .beam file
+if [ -f "$MODULE_NAME.beam" ]; then
+  # Try to find the start function
+  START_FN=$(erl -noshell -eval "io:format(\"~p\", [code:which($MODULE_NAME)]), halt()." 2>/dev/null | xargs -0 beam_lib disasm 2>/dev/null | grep -E "function start/0" || echo "")
+  
+  if [ -n "$START_FN" ]; then
+    echo "Found start/0 function in $MODULE_NAME, using it to start"
+    erl -pa . -pa ./deps/*/ebin -s debugger start -s $MODULE_NAME start -noshell
+  else
+    echo "No start/0 function found in $MODULE_NAME, starting debugger only"
+    erl -pa . -pa ./deps/*/ebin -s debugger start -noshell
+  fi
+else
+  echo "Module $MODULE_NAME.beam not found"
+  exit 1
+fi
+EOF
+
+          chmod +x debug_runner.sh
+          
+          # Run the main module in debug mode
+          echo "Starting debug session for $MAIN_MODULE"
+          ./debug_runner.sh "$MAIN_MODULE"
+          
+          echo "Debug session completed"
+        else
+          echo "Error: Unknown build mode '${{ inputs.build-mode }}'. Use 'build' or 'debug'."
+          exit 1
+        fi
+        
+    - name: List build outputs
+      shell: bash
+      run: |
+        echo "Build outputs in ${{ inputs.output-dir }}:"
+        ls -la ${{ inputs.output-dir }}
